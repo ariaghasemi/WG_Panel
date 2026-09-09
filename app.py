@@ -1626,31 +1626,71 @@ def _validate_node_base_url(base_url: str) -> tuple[bool, str]:
 #--------------------------------
 # Fernet encryption at rest
 #_______________________________
-_fernet = None
-try:
-    from cryptography.fernet import Fernet
-    key = os.environ.get('FERNET_KEY')
-    if key:
-        _fernet = Fernet(key)
-except Exception:
-    _fernet = None
+def _load_fernet_from_env() -> Fernet:
+    """Load and validate the encryption key used for persisted secrets.
+
+    Railway and some dotenv editors may preserve surrounding quotes or users may
+    paste a Fernet key without its trailing base64 padding.  Both forms can be
+    normalised safely; any other malformed value must fail at startup rather
+    than silently creating a new key and making existing data undecryptable.
+    """
+    raw_key = os.environ.get("FERNET_KEY", "").strip()
+    if not raw_key:
+        raise RuntimeError(
+            "FERNET_KEY is not set. Generate one with: "
+            "python -c \"from cryptography.fernet import Fernet; "
+            "print(Fernet.generate_key().decode())\""
+        )
+
+    # Environment dashboards sometimes store copied values as 'value' or
+    # "value". Only remove matching outer quotes, never characters inside it.
+    if len(raw_key) >= 2 and raw_key[0] == raw_key[-1] and raw_key[0] in "'\"":
+        raw_key = raw_key[1:-1].strip()
+
+    # A valid key decodes to 32 bytes. Restore omitted URL-safe base64 padding.
+    normalised_key = raw_key + ("=" * (-len(raw_key) % 4))
+    try:
+        return Fernet(normalised_key.encode("ascii"))
+    except (ValueError, TypeError, UnicodeEncodeError) as exc:
+        raise RuntimeError(
+            "FERNET_KEY is invalid: it must be a 32-byte URL-safe base64 "
+            "Fernet key (normally 44 characters). Generate one with: "
+            "python -c \"from cryptography.fernet import Fernet; "
+            "print(Fernet.generate_key().decode())\""
+        ) from exc
 
 
-FERNET_KEY = os.environ.get('FERNET_KEY')
-if not FERNET_KEY:
-    raise RuntimeError("FERNET_KEY is not set. Generate one and export it before starting the app.")
-fernet = Fernet(FERNET_KEY.encode())
+fernet = _load_fernet_from_env()
+
+# Config normally supplies SECRET_KEY, but guarantee that Flask sessions are
+# available even when a deployment platform injects FLASK_SECRET_KEY as an
+# empty value. This runs after Fernet validation, so the fallback is based on a
+# valid, stable high-entropy deployment secret rather than an ephemeral value.
+if not app.secret_key:
+    _fernet_key_material = os.environ["FERNET_KEY"].strip().encode("utf-8")
+    app.secret_key = hashlib.sha256(
+        b"WG_Panel Flask session key\x00" + _fernet_key_material
+    ).hexdigest()
+    app.logger.info(
+        "FLASK_SECRET_KEY is empty; using stable session key derived from FERNET_KEY"
+    )
+
+# Keep the old internal name as an alias for backward-compatible helper code.
+_fernet = fernet
+
 
 def _probably_encrypt(s: str) -> str:
-    if _fernet and s:
-        return _fernet.encrypt(s.encode()).decode()
+    if s:
+        return fernet.encrypt(s.encode()).decode()
     return s
 
+
 def _probably_decrypt(s: str) -> str:
-    if _fernet and s:
+    if s:
         try:
-            return _fernet.decrypt(s.encode()).decode()
-        except Exception:
+            return fernet.decrypt(s.encode()).decode()
+        except InvalidToken:
+            # Existing installations can still contain pre-encryption plaintext.
             return s
     return s
 
