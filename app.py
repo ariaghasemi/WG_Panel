@@ -1661,6 +1661,20 @@ def _load_fernet_from_env() -> Fernet:
 
 
 fernet = _load_fernet_from_env()
+
+# Config normally supplies SECRET_KEY, but guarantee that Flask sessions are
+# available even when a deployment platform injects FLASK_SECRET_KEY as an
+# empty value. This runs after Fernet validation, so the fallback is based on a
+# valid, stable high-entropy deployment secret rather than an ephemeral value.
+if not app.secret_key:
+    _fernet_key_material = os.environ["FERNET_KEY"].strip().encode("utf-8")
+    app.secret_key = hashlib.sha256(
+        b"WG_Panel Flask session key\x00" + _fernet_key_material
+    ).hexdigest()
+    app.logger.info(
+        "FLASK_SECRET_KEY is empty; using stable session key derived from FERNET_KEY"
+    )
+
 # Keep the old internal name as an alias for backward-compatible helper code.
 _fernet = fernet
 
